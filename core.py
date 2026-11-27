@@ -1,357 +1,407 @@
 import os
+import subprocess
 import sys
-# single thread doubles cuda performance - needs to be set before torch import
-if any(arg.startswith('--execution-provider') for arg in sys.argv):
-    os.environ['OMP_NUM_THREADS'] = '6'
-# reduce tensorflow log level
-os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2'
-import warnings
-from typing import List
-import platform
-import signal
-import shutil
-import argparse
-try:
-    import torch
-    HAS_TORCH = True
-except ImportError:
-    HAS_TORCH = False
-import onnxruntime
-try:
-    import tensorflow
-    HAS_TENSORFLOW = True
-except ImportError:
-    HAS_TENSORFLOW = False
+import importlib
+from concurrent.futures import ThreadPoolExecutor
+from types import ModuleType
+from typing import Any, List, Callable
 
+import numpy as np
+from tqdm import tqdm
+
+import modules
 import modules.globals
-import modules.metadata
-import modules.ui as ui
-from modules.processors.frame.core import get_frame_processors_modules, process_video_in_memory
-from modules.utilities import has_image_extension, is_image, is_video, detect_fps, create_video, extract_frames, get_temp_frame_paths, restore_audio, create_temp, move_temp, clean_temp, normalize_output_path
+from modules.face_analyser import get_one_face
 
-if HAS_TORCH and 'ROCMExecutionProvider' in modules.globals.execution_providers:
-    del torch
+FRAME_PROCESSORS_MODULES: List[ModuleType] = []
+FRAME_PROCESSORS_INTERFACE = [
+    'pre_check',
+    'pre_start',
+    'process_frame',
+    'process_image',
+    'process_video'
+]
 
-warnings.filterwarnings('ignore', category=FutureWarning, module='insightface')
-if HAS_TORCH:
-    warnings.filterwarnings('ignore', category=UserWarning, module='torchvision')
+ALLOWED_PROCESSORS = {
+    'face_swapper',
+    'face_enhancer',
+    'face_enhancer_gpen256',
+    'face_enhancer_gpen512'
+}
 
-
-def parse_args() -> None:
-    signal.signal(signal.SIGINT, lambda signal_number, frame: destroy())
-    program = argparse.ArgumentParser()
-    program.add_argument('-s', '--source', help='select an source image', dest='source_path')
-    program.add_argument('-t', '--target', help='select an target image or video', dest='target_path')
-    program.add_argument('-o', '--output', help='select output file or directory', dest='output_path')
-    program.add_argument('--frame-processor', help='pipeline of frame processors', dest='frame_processor', default=['face_swapper'], choices=['face_swapper', 'face_enhancer', 'face_enhancer_gpen256', 'face_enhancer_gpen512'], nargs='+')
-    program.add_argument('--keep-fps', help='keep original fps', dest='keep_fps', action='store_true', default=False)
-    program.add_argument('--keep-audio', help='keep original audio', dest='keep_audio', action='store_true', default=True)
-    program.add_argument('--keep-frames', help='keep temporary frames', dest='keep_frames', action='store_true', default=False)
-    program.add_argument('--many-faces', help='process every face', dest='many_faces', action='store_true', default=False)
-    program.add_argument('--nsfw-filter', help='filter the NSFW image or video', dest='nsfw_filter', action='store_true', default=False)
-    program.add_argument('--map-faces', help='map source target faces', dest='map_faces', action='store_true', default=False)
-    program.add_argument('--mouth-mask', help='mask the mouth region', dest='mouth_mask', action='store_true', default=False)
-    program.add_argument('--video-encoder', help='adjust output video encoder', dest='video_encoder', default='libx264', choices=['libx264', 'libx265', 'libvpx-vp9'])
-    program.add_argument('--video-quality', help='adjust output video quality', dest='video_quality', type=int, default=18, choices=range(52), metavar='[0-51]')
-    program.add_argument('-l', '--lang', help='Ui language', default="en")
-    program.add_argument('--live-mirror', help='The live camera display as you see it in the front-facing camera frame', dest='live_mirror', action='store_true', default=False)
-    program.add_argument('--live-resizable', help='The live camera frame is resizable', dest='live_resizable', action='store_true', default=False)
-    program.add_argument('--max-memory', help='maximum amount of RAM in GB', dest='max_memory', type=int, default=suggest_max_memory())
-    program.add_argument('--execution-provider', help='execution provider', dest='execution_provider', default=[suggest_default_execution_provider()], choices=suggest_execution_providers(), nargs='+')
-    program.add_argument('--execution-threads', help='number of execution threads', dest='execution_threads', type=int, default=None)
-    program.add_argument('--det-size', help='face detection input size (160, 320, or 640)', dest='det_size', type=int, default=modules.globals.DEFAULT_DET_SIZE, choices=[160, 320, 640])
-    program.add_argument('-v', '--version', action='version', version=f'{modules.metadata.name} {modules.metadata.version}')
-
-    # register deprecated args
-    program.add_argument('-f', '--face', help=argparse.SUPPRESS, dest='source_path_deprecated')
-    program.add_argument('--cpu-cores', help=argparse.SUPPRESS, dest='cpu_cores_deprecated', type=int)
-    program.add_argument('--gpu-vendor', help=argparse.SUPPRESS, dest='gpu_vendor_deprecated')
-    program.add_argument('--gpu-threads', help=argparse.SUPPRESS, dest='gpu_threads_deprecated', type=int)
-
-    args = program.parse_args()
-
-    modules.globals.source_path = args.source_path
-    modules.globals.target_path = args.target_path
-    modules.globals.output_path = normalize_output_path(modules.globals.source_path, modules.globals.target_path, args.output_path)
-    modules.globals.frame_processors = args.frame_processor
-    modules.globals.headless = args.source_path or args.target_path or args.output_path
-    modules.globals.keep_fps = args.keep_fps
-    modules.globals.keep_audio = args.keep_audio
-    modules.globals.keep_frames = args.keep_frames
-    modules.globals.many_faces = args.many_faces
-    modules.globals.mouth_mask = args.mouth_mask
-    modules.globals.nsfw_filter = args.nsfw_filter
-    modules.globals.map_faces = args.map_faces
-    modules.globals.video_encoder = args.video_encoder
-    modules.globals.video_quality = args.video_quality
-    modules.globals.live_mirror = args.live_mirror
-    modules.globals.live_resizable = args.live_resizable
-    modules.globals.max_memory = args.max_memory
-    modules.globals.execution_providers = decode_execution_providers(args.execution_provider)
-    modules.globals.execution_threads = args.execution_threads
-    modules.globals.det_size = args.det_size
-    modules.globals.lang = args.lang
-
-    # The argparse default (None) avoids evaluating suggest_execution_threads()
-    # before providers are decoded, and deprecated-arg overrides above may
-    # have already set execution_threads.
-    if modules.globals.execution_threads is None:
-        modules.globals.execution_threads = suggest_execution_threads()
-
-    #for ENHANCER tumblers:
-    for enhancer_key in ('face_enhancer', 'face_enhancer_gpen256', 'face_enhancer_gpen512'):
-        modules.globals.fp_ui[enhancer_key] = enhancer_key in args.frame_processor
-
-    # translate deprecated args
-    if args.source_path_deprecated:
-        print('\033[33mArgument -f and --face are deprecated. Use -s and --source instead.\033[0m')
-        modules.globals.source_path = args.source_path_deprecated
-        modules.globals.output_path = normalize_output_path(args.source_path_deprecated, modules.globals.target_path, args.output_path)
-    if args.cpu_cores_deprecated:
-        print('\033[33mArgument --cpu-cores is deprecated. Use --execution-threads instead.\033[0m')
-        modules.globals.execution_threads = args.cpu_cores_deprecated
-    if args.gpu_vendor_deprecated == 'apple':
-        print('\033[33mArgument --gpu-vendor apple is deprecated. Use --execution-provider coreml instead.\033[0m')
-        modules.globals.execution_providers = decode_execution_providers(['coreml'])
-    if args.gpu_vendor_deprecated == 'nvidia':
-        print('\033[33mArgument --gpu-vendor nvidia is deprecated. Use --execution-provider cuda instead.\033[0m')
-        modules.globals.execution_providers = decode_execution_providers(['cuda'])
-    if args.gpu_vendor_deprecated == 'amd':
-        print('\033[33mArgument --gpu-vendor amd is deprecated. Use --execution-provider cuda instead.\033[0m')
-        modules.globals.execution_providers = decode_execution_providers(['rocm'])
-    if args.gpu_threads_deprecated:
-        print('\033[33mArgument --gpu-threads is deprecated. Use --execution-threads instead.\033[0m')
-        modules.globals.execution_threads = args.gpu_threads_deprecated
+def load_frame_processor_module(frame_processor: str) -> Any:
+    if frame_processor not in ALLOWED_PROCESSORS:
+        print(f"Frame processor {frame_processor} is not allowed")
+        sys.exit()
+    try:
+        frame_processor_module = importlib.import_module(f'modules.processors.frame.{frame_processor}')
+        for method_name in FRAME_PROCESSORS_INTERFACE:
+            if not hasattr(frame_processor_module, method_name):
+                print(f"Frame processor {frame_processor} is missing required method {method_name}")
+                sys.exit()
+    except ImportError:
+        print(f"Frame processor {frame_processor} not found")
+        sys.exit()
+    return frame_processor_module
 
 
-def encode_execution_providers(execution_providers: List[str]) -> List[str]:
-    return [execution_provider.replace('ExecutionProvider', '').lower() for execution_provider in execution_providers]
+def get_frame_processors_modules(frame_processors: List[str]) -> List[ModuleType]:
+    global FRAME_PROCESSORS_MODULES
 
+    if not FRAME_PROCESSORS_MODULES:
+        for frame_processor in frame_processors:
+            frame_processor_module = load_frame_processor_module(frame_processor)
+            FRAME_PROCESSORS_MODULES.append(frame_processor_module)
+    set_frame_processors_modules_from_ui(frame_processors)
+    return FRAME_PROCESSORS_MODULES
 
-def decode_execution_providers(execution_providers: List[str]) -> List[str]:
-    return [provider for provider, encoded_execution_provider in zip(onnxruntime.get_available_providers(), encode_execution_providers(onnxruntime.get_available_providers()))
-            if any(execution_provider in encoded_execution_provider for execution_provider in execution_providers)]
+def set_frame_processors_modules_from_ui(frame_processors: List[str]) -> None:
+    global FRAME_PROCESSORS_MODULES
+    current_processor_names = [proc.__name__.split('.')[-1] for proc in FRAME_PROCESSORS_MODULES]
 
+    for frame_processor, state in modules.globals.fp_ui.items():
+        if state and frame_processor not in current_processor_names:
+            try:
+                frame_processor_module = load_frame_processor_module(frame_processor)
+                FRAME_PROCESSORS_MODULES.append(frame_processor_module)
+                if frame_processor not in modules.globals.frame_processors:
+                     modules.globals.frame_processors.append(frame_processor)
+            except SystemExit:
+                 print(f"Warning: Failed to load frame processor {frame_processor} requested by UI state.")
+            except Exception as e:
+                 print(f"Warning: Error loading frame processor {frame_processor} requested by UI state: {e}")
 
-def suggest_max_memory() -> int:
-    if platform.system().lower() == 'darwin':
-        return 4
-    return 16
+        elif not state and frame_processor in current_processor_names:
+            try:
+                module_to_remove = next((mod for mod in FRAME_PROCESSORS_MODULES if mod.__name__.endswith(f'.{frame_processor}')), None)
+                if module_to_remove:
+                    FRAME_PROCESSORS_MODULES.remove(module_to_remove)
+                if frame_processor in modules.globals.frame_processors:
+                    modules.globals.frame_processors.remove(frame_processor)
+            except Exception as e:
+                 print(f"Warning: Error removing frame processor {frame_processor}: {e}")
 
-
-def suggest_default_execution_provider() -> str:
-    """Pick the best available provider: cuda > rocm > coreml > openvino > dml > cpu."""
-    available = encode_execution_providers(onnxruntime.get_available_providers())
-    for pref in ('cuda', 'rocm', 'coreml', 'openvino', 'dml'):
-        if pref in available:
-            return pref
-    return 'cpu'
-
-
-def suggest_execution_providers() -> List[str]:
-    return encode_execution_providers(onnxruntime.get_available_providers())
-
-
-def suggest_execution_threads() -> int:
-    """Suggest optimal thread count based on hardware and execution provider."""
-    import os
+def multi_process_frame(source_path: str, temp_frame_paths: List[str], process_frames: Callable[[str, List[str], Any], None], progress: Any = None) -> None:
+    """Process frames in parallel with optimized batching and memory management."""
+    max_workers = modules.globals.execution_threads
     
-    # Get CPU count
-    cpu_count = os.cpu_count() or 4
+    # Determine optimal batch size based on available memory and thread count
+    # Process frames in batches to avoid memory overflow
+    batch_size = max(1, min(32, len(temp_frame_paths) // max(1, max_workers)))
     
-    if 'DmlExecutionProvider' in modules.globals.execution_providers:
-        return 1
-    if 'ROCMExecutionProvider' in modules.globals.execution_providers:
-        return 1
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        # Process in batches to manage memory better
+        for i in range(0, len(temp_frame_paths), batch_size):
+            batch = temp_frame_paths[i:i + batch_size]
+            futures = []
+            
+            for path in batch:
+                future = executor.submit(process_frames, source_path, [path], progress)
+                futures.append(future)
+            
+            # Wait for batch to complete before starting next batch
+            for future in futures:
+                try:
+                    future.result()
+                except Exception as e:
+                    print(f"Error processing frame: {e}")
+
+
+def process_video(source_path: str, frame_paths: list[str], process_frames: Callable[[str, List[str], Any], None]) -> None:
+    progress_bar_format = '{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}{postfix}]'
+    total = len(frame_paths)
+    with tqdm(total=total, desc='Processing', unit='frame', dynamic_ncols=True, bar_format=progress_bar_format) as progress:
+        progress.set_postfix({'execution_providers': modules.globals.execution_providers, 'execution_threads': modules.globals.execution_threads, 'max_memory': modules.globals.max_memory})
+        multi_process_frame(source_path, frame_paths, process_frames, progress)
+
+
+def process_video_in_memory(source_path: str, target_path: str, fps: float) -> bool:
+    """Process video frames in-memory using FFmpeg pipes, eliminating disk I/O.
+
+    Reads raw frames from the source video via an FFmpeg decoder pipe, runs each
+    frame through all active frame processors sequentially, and writes the
+    result directly to an FFmpeg encoder pipe.  This avoids extracting frames to
+    PNG on disk, which is the biggest I/O bottleneck in the disk-based pipeline.
+
+    Returns True on success, False on failure (caller should fall back to the
+    disk-based pipeline).
+    """
+    from modules import imread_unicode
+    from modules.face_analyser import get_one_face
+    from modules.utilities import (
+        get_video_dimensions,
+        estimate_frame_count,
+        get_temp_output_path,
+    )
+
+    temp_output_path = get_temp_output_path(target_path)
+
+    # --- Pre-load source face (needed by face_swapper in simple mode) ---
+    source_face = None
+    if source_path and os.path.exists(source_path):
+        source_img = imread_unicode(source_path)
+        if source_img is not None:
+            source_face = get_one_face(source_img)
+            del source_img
+        if source_face is None:
+            print("[DLC.CORE] Warning: No face detected in source image. "
+                  "Face swapping will be skipped.")
+
+    # --- Collect frame processors & reset per-video state ---
+    frame_processors = get_frame_processors_modules(modules.globals.frame_processors)
+    for fp in frame_processors:
+        if hasattr(fp, 'PREVIOUS_FRAME_RESULT'):
+            fp.PREVIOUS_FRAME_RESULT = None
+
+    # --- Video metadata ---
+    try:
+        width, height = get_video_dimensions(target_path)
+    except Exception as e:
+        print(f"[DLC.CORE] Failed to get video dimensions: {e}")
+        return False
+
+    total_frames = estimate_frame_count(target_path, fps)
+    frame_size = width * height * 3
+
+    # --- Build encoder arguments ---
+    encoder = modules.globals.video_encoder
+    encoder_options: List[str] = []
+    is_hw_encoder = False
+
     if 'CUDAExecutionProvider' in modules.globals.execution_providers:
-        return 2
-    if 'OpenVINOExecutionProvider' in modules.globals.execution_providers:
-        return 1
-    
-    # For CPU execution, use most cores but leave some for system
-    return max(4, min(cpu_count - 2, 16))
+        if encoder == 'libx264':
+            encoder = 'h264_nvenc'
+            is_hw_encoder = True
+            encoder_options = [
+                '-preset', 'p4', '-tune', 'hq', '-rc', 'vbr',
+                '-cq', str(modules.globals.video_quality), '-b:v', '0',
+            ]
+        elif encoder == 'libx265':
+            encoder = 'hevc_nvenc'
+            is_hw_encoder = True
+            encoder_options = [
+                '-preset', 'p4', '-tune', 'hq', '-rc', 'vbr',
+                '-cq', str(modules.globals.video_quality), '-b:v', '0',
+            ]
+    elif 'DmlExecutionProvider' in modules.globals.execution_providers:
+        if encoder == 'libx264':
+            encoder = 'h264_amf'
+            is_hw_encoder = True
+            encoder_options = [
+                '-quality', 'quality', '-rc', 'vbr_latency',
+                '-qp_i', str(modules.globals.video_quality),
+                '-qp_p', str(modules.globals.video_quality),
+            ]
+        elif encoder == 'libx265':
+            encoder = 'hevc_amf'
+            is_hw_encoder = True
+            encoder_options = [
+                '-quality', 'quality', '-rc', 'vbr_latency',
+                '-qp_i', str(modules.globals.video_quality),
+                '-qp_p', str(modules.globals.video_quality),
+            ]
 
+    if not is_hw_encoder:
+        if encoder == 'libx264':
+            encoder_options = [
+                '-preset', 'medium',
+                '-crf', str(modules.globals.video_quality),
+                '-tune', 'film',
+            ]
+        elif encoder == 'libx265':
+            encoder_options = [
+                '-preset', 'medium',
+                '-crf', str(modules.globals.video_quality),
+                '-x265-params', 'log-level=error',
+            ]
+        elif encoder == 'libvpx-vp9':
+            encoder_options = [
+                '-crf', str(modules.globals.video_quality),
+                '-b:v', '0', '-cpu-used', '2',
+            ]
 
-def limit_resources() -> None:
-    # prevent tensorflow memory leak
-    if HAS_TENSORFLOW:
-        gpus = tensorflow.config.experimental.list_physical_devices('GPU')
-        for gpu in gpus:
-            tensorflow.config.experimental.set_memory_growth(gpu, True)
-    # limit memory usage
-    if modules.globals.max_memory:
-        # setrlimit(RLIMIT_DATA) fails with EINVAL on macOS, crashing on launch.
-        # See https://github.com/hacksider/Deep-Live-Cam/issues/1848
-        if platform.system().lower() == 'darwin':
-            return
-        memory = modules.globals.max_memory * 1024 ** 3
-        if platform.system().lower() == 'windows':
-            import ctypes
-            kernel32 = ctypes.windll.kernel32
-            kernel32.SetProcessWorkingSetSize(-1, ctypes.c_size_t(memory), ctypes.c_size_t(memory))
-        else:
-            import resource
-            resource.setrlimit(resource.RLIMIT_DATA, (memory, memory))
+    # --- Attempt pipeline (hw encoder first, then sw fallback) ---
+    encoders_to_try = [(encoder, encoder_options)]
+    if is_hw_encoder:
+        # Software fallback
+        sw_encoder = 'libx264'
+        sw_options = [
+            '-preset', 'medium',
+            '-crf', str(modules.globals.video_quality),
+            '-tune', 'film',
+        ]
+        encoders_to_try.append((sw_encoder, sw_options))
 
+    for attempt, (enc, enc_opts) in enumerate(encoders_to_try):
+        # Reset interpolation state on retry
+        if attempt > 0:
+            for fp in frame_processors:
+                if hasattr(fp, 'PREVIOUS_FRAME_RESULT'):
+                    fp.PREVIOUS_FRAME_RESULT = None
 
-def release_resources() -> None:
-    if 'CUDAExecutionProvider' in modules.globals.execution_providers and HAS_TORCH:
-        torch.cuda.empty_cache()
-
-
-def pre_check() -> bool:
-    if sys.version_info < (3, 9):
-        update_status('Python version is not supported - please upgrade to 3.9 or higher.')
-        return False
-    if not shutil.which('ffmpeg'):
-        update_status('ffmpeg is not installed.')
-        return False
-    return True
-
-
-def update_status(message: str, scope: str = 'DLC.CORE') -> None:
-    print(f'[{scope}] {message}')
-    if not modules.globals.headless:
-        ui.update_status(message)
-
-def start() -> None:
-    """Start processing with performance monitoring."""
-    import time
-    
-    start_time = time.time()
-    
-    for frame_processor in get_frame_processors_modules(modules.globals.frame_processors):
-        if not frame_processor.pre_start():
-            return
-    update_status('Processing...')
-    
-    # process image to image
-    if has_image_extension(modules.globals.target_path):
-        if modules.globals.nsfw_filter and ui.check_and_ignore_nsfw(modules.globals.target_path, destroy):
-            return
-        try:
-            shutil.copy2(modules.globals.target_path, modules.globals.output_path)
-        except Exception as e:
-            print("Error copying file:", str(e))
-        for frame_processor in get_frame_processors_modules(modules.globals.frame_processors):
-            update_status('Progressing...', frame_processor.NAME)
-            frame_processor.process_image(modules.globals.source_path, modules.globals.output_path, modules.globals.output_path)
-            release_resources()
-        if is_image(modules.globals.target_path):
-            elapsed = time.time() - start_time
-            update_status(f'Processing to image succeed! (Time: {elapsed:.2f}s)')
-        else:
-            update_status('Processing to image failed!')
-        return
-    
-    # process image to videos
-    if modules.globals.nsfw_filter and ui.check_and_ignore_nsfw(modules.globals.target_path, destroy):
-        return
-
-    # Detect FPS early (needed by both pipelines)
-    if modules.globals.keep_fps:
-        update_status('Detecting fps...')
-        fps = detect_fps(modules.globals.target_path)
-    else:
-        fps = 30.0
-
-    video_created = False
-
-    # --- In-memory pipeline (non-map_faces only) ---
-    # Reads frames from FFmpeg pipe, processes in memory, encodes directly.
-    # Eliminates all per-frame PNG disk I/O for a major speed-up.
-    if not modules.globals.map_faces:
-        update_status(f'Processing video in-memory at {fps} fps...')
-        create_temp(modules.globals.target_path)
-
-        processing_start = time.time()
-        video_created = process_video_in_memory(
-            modules.globals.source_path,
-            modules.globals.target_path,
-            fps,
+        success = _run_pipe_pipeline(
+            target_path, temp_output_path, fps,
+            source_face, frame_processors,
+            width, height, frame_size, total_frames,
+            enc, enc_opts,
         )
-        processing_time = time.time() - processing_start
-        release_resources()
+        if success:
+            return True
 
-        if video_created:
-            update_status(f'In-memory processing + encoding completed in {processing_time:.2f}s')
+        if attempt == 0 and is_hw_encoder:
+            print(f"[DLC.CORE] Hardware encoder '{enc}' failed, "
+                  f"retrying with software encoder...")
 
-    # --- Disk-based fallback (required for map_faces, or if pipe failed) ---
-    if not video_created:
-        if not modules.globals.map_faces:
-            update_status('Falling back to disk-based processing...')
-
-        extraction_start = time.time()
-        create_temp(modules.globals.target_path)
-        update_status('Extracting frames...')
-        extract_frames(modules.globals.target_path)
-        extraction_time = time.time() - extraction_start
-
-        temp_frame_paths = get_temp_frame_paths(modules.globals.target_path)
-        total_frames = len(temp_frame_paths)
-        update_status(f'Processing {total_frames} frames with {modules.globals.execution_threads} threads...')
-
-        processing_start = time.time()
-        for frame_processor in get_frame_processors_modules(modules.globals.frame_processors):
-            update_status('Progressing...', frame_processor.NAME)
-            frame_processor.process_video(modules.globals.source_path, temp_frame_paths)
-            release_resources()
-        processing_time = time.time() - processing_start
-        fps_processing = total_frames / processing_time if processing_time > 0 else 0
-        update_status(f'Frame processing completed in {processing_time:.2f}s ({fps_processing:.2f} fps)')
-
-        encoding_start = time.time()
-        update_status(f'Creating video with {fps} fps...')
-        video_created = create_video(modules.globals.target_path, fps)
-        encoding_time = time.time() - encoding_start
-        if video_created:
-            update_status(f'Video encoding completed in {encoding_time:.2f}s')
-
-    if not video_created:
-        update_status('Video encoding failed. No temporary output video was created.')
-        clean_temp(modules.globals.target_path)
-        return
-    
-    # handle audio
-    if modules.globals.keep_audio:
-        if modules.globals.keep_fps:
-            update_status('Restoring audio...')
-        else:
-            update_status('Restoring audio might cause issues as fps are not kept...')
-        restore_audio(modules.globals.target_path, modules.globals.output_path)
-    else:
-        move_temp(modules.globals.target_path, modules.globals.output_path)
-    
-    # clean and validate
-    clean_temp(modules.globals.target_path)
-    
-    total_time = time.time() - start_time
-    if is_video(modules.globals.target_path) and modules.globals.output_path and os.path.isfile(modules.globals.output_path):
-        update_status(f'Video processing succeeded! Total time: {total_time:.2f}s')
-    else:
-        update_status('Processing to video failed!')
+    return False
 
 
-def destroy(to_quit=True) -> None:
-    if modules.globals.target_path:
-        clean_temp(modules.globals.target_path)
-    if to_quit:
-        quit()
+def _run_pipe_pipeline(
+    target_path: str,
+    temp_output_path: str,
+    fps: float,
+    source_face: Any,
+    frame_processors: List[Any],
+    width: int,
+    height: int,
+    frame_size: int,
+    total_frames: int,
+    encoder: str,
+    encoder_options: List[str],
+) -> bool:
+    """Run the FFmpeg-pipe read → process → encode pipeline once."""
 
+    # --- Reader: decode source video to raw BGR24 on stdout ---
+    reader_cmd = [
+        'ffmpeg', '-hide_banner',
+        '-hwaccel', 'auto',
+        '-i', target_path,
+        '-f', 'rawvideo',
+        '-pix_fmt', 'bgr24',
+        '-v', 'error',
+        '-',
+    ]
 
-def run() -> None:
-    parse_args()
-    if not pre_check():
-        return
-    for frame_processor in get_frame_processors_modules(modules.globals.frame_processors):
-        if not frame_processor.pre_check():
-            return
-    # Pre-load face analyser in main thread before GUI starts
-    #from modules.face_analyser import get_face_analyser
-    #get_face_analyser()
-    limit_resources()
-    if modules.globals.headless:
-        start()
-    else:
-        window = ui.init(start, destroy, modules.globals.lang)
-        window.mainloop()
+    # --- Writer: encode raw BGR24 from stdin ---
+    writer_cmd = [
+        'ffmpeg', '-hide_banner',
+        '-f', 'rawvideo',
+        '-pix_fmt', 'bgr24',
+        '-s', f'{width}x{height}',
+        '-r', str(fps),
+        '-i', '-',
+        '-c:v', encoder,
+    ]
+    writer_cmd.extend(encoder_options)
+    writer_cmd.extend([
+        '-pix_fmt', 'yuv420p',
+        '-movflags', '+faststart',
+        '-vf', 'colorspace=bt709:iall=bt601-6-625:fast=1',
+        '-v', 'error',
+        '-y', temp_output_path,
+    ])
+
+    reader = None
+    writer = None
+    try:
+        reader = subprocess.Popen(
+            reader_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        )
+        writer = subprocess.Popen(
+            writer_cmd, stdin=subprocess.PIPE, stderr=subprocess.PIPE,
+        )
+    except Exception as e:
+        print(f"[DLC.CORE] Failed to start FFmpeg pipes: {e}")
+        for proc in (reader, writer):
+            if proc:
+                try:
+                    proc.kill()
+                except Exception:
+                    pass
+        return False
+
+    processed_count = 0
+    bar_fmt = ('{l_bar}{bar}| {n_fmt}/{total_fmt} '
+               '[{elapsed}<{remaining}, {rate_fmt}{postfix}]')
+
+    try:
+        with tqdm(total=total_frames, desc='Processing', unit='frame',
+                  dynamic_ncols=True, bar_format=bar_fmt) as progress:
+            progress.set_postfix({
+                'execution_providers': modules.globals.execution_providers,
+                'threads': modules.globals.execution_threads,
+                'mode': 'in-memory',
+            })
+
+            # Pipelined detection: while processing frame N (swap on
+            # ANE), start detecting the face in the next frame
+            # (detection on GPU).  They use different hardware units
+            # so the work overlaps.
+            detect_executor = ThreadPoolExecutor(max_workers=1)
+            pending_detect = None
+            use_pipeline = not modules.globals.many_faces
+
+            while True:
+                raw = reader.stdout.read(frame_size)
+                if len(raw) != frame_size:
+                    break
+
+                frame = np.frombuffer(raw, dtype=np.uint8).reshape(
+                    (height, width, 3)
+                ).copy()
+
+                # Get the detection result for THIS frame
+                if use_pipeline:
+                    if pending_detect is not None:
+                        target_face = pending_detect.result()
+                    else:
+                        target_face = get_one_face(frame)
+                    # Start detecting on THIS frame eagerly — the result
+                    # will be used for the next iteration.  At video
+                    # frame rates the face barely moves between frames.
+                    # Hand the detector its own copy: the frame processors
+                    # below mutate `frame` in place (paste-back), which
+                    # would otherwise race with detection.
+                    pending_detect = detect_executor.submit(
+                        get_one_face, frame.copy())
+                else:
+                    target_face = None
+
+                # Run frame through every active processor
+                for fp in frame_processors:
+                    try:
+                        frame = fp.process_frame(source_face, frame, target_face=target_face)
+                    except TypeError:
+                        frame = fp.process_frame(source_face, frame)
+
+                writer.stdin.write(frame.tobytes())
+                processed_count += 1
+                progress.update(1)
+
+            detect_executor.shutdown(wait=True)
+
+        # Graceful shutdown
+        writer.stdin.close()
+        writer.wait()
+        reader.wait()
+
+        if writer.returncode != 0:
+            stderr_out = writer.stderr.read().decode(errors='ignore').strip()
+            if stderr_out:
+                print(f"[DLC.CORE] FFmpeg encoder error: {stderr_out}")
+            return False
+
+        return processed_count > 0 and os.path.isfile(temp_output_path)
+
+    except BrokenPipeError:
+        print("[DLC.CORE] FFmpeg pipe broken (encoder may not be available).")
+        return False
+    except Exception as e:
+        print(f"[DLC.CORE] In-memory processing error: {e}")
+        return False
+    finally:
+        for proc in (reader, writer):
+            if proc:
+                try:
+                    proc.kill()
+                except Exception:
+                    pass
